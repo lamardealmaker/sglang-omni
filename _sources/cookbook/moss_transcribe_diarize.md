@@ -7,6 +7,7 @@ MOSS-Transcribe-Diarize does not support `/v1/audio/translations`; that endpoint
 ![Model Architecture](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/main/Model_Architecture.png)
 
 It transcribes speech, assigns speakers, and predicts timestamps in a single generation pass. With 128K context, it supports up to ~90-minute audio, handles meetings, interruptions, long conversations, and overlapping speech, and adds hotword boosting for names, companies, product terms, and domain vocabulary. MOSS-Transcribe-Diarize is served through the OpenAI-compatible `/v1/audio/transcriptions` endpoint.
+Transcriptions support `response_format=srt` or `response_format=vtt` with real segment timestamps for this model.
 
 | Component | Spec |
 |---|---|
@@ -75,7 +76,9 @@ At c=1 with longer audio, AR Decode takes 94%+ of total time — the leverage is
 
 The optimization stack mirrors [what we built for TTS](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md), sharing the same core infrastructure with ASR-specific adaptations.
 
-**CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. The Whisper encoder gets the same treatment, bucketed over chunk count (`encoder_chunk_buckets`, default `1..8` ≈ 4 min of audio).
+**CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. Breakable prefill graphs bucket over token count instead, and the ladder starts at 1 and 2: a fully cached prefix still re-prefills its last token, and that 1-token extend would otherwise pad to the 4-token floor and exceed SGLang's 2x padding guard, falling back to eager. The 2-token bucket sits exactly on that guard, so it replays either way and only saves the padding. The Whisper encoder gets the same treatment, bucketed over chunk count (`encoder_chunk_buckets`, default `1..8` ≈ 4 min of audio).
+
+**Decoder Torch Compile.** The default pipeline compiles Qwen3 decoder shapes through batch size 4 and uses the eager decoder above that cap. Override the cap with `--torch-compile-max-bs`, or disable decoder compilation with `--torch-compile off`. Compilation runs once per captured decode bucket at startup (`max-autotune-no-cudagraphs`), so cold start pays an autotuning cost before the server accepts traffic. This setting is independent of the encoder compile option below.
 
 **Encoder Torch Compile (opt-in).** `encoder_torch_compile=True` swaps the encoder CUDA graph for `torch.compile` (default mode) with kernel fusion. The two are mutually exclusive. Reduce-overhead mode must not be used: its cudagraph trees corrupt memory alongside the decode CUDA graphs that always run in this process (illegal memory access after ~60s of serving). The cost is a one-time per-bucket compile at startup; `dynamic=False` means only the warmed chunk counts are accelerated, anything else runs eager.
 
@@ -95,21 +98,11 @@ Unlike TTS where the same reference voice is reused across many prompts (high hi
 
 ### Launching Commands
 
-Install `sglang-omni` by following [Installation](../get_started/installation.md), then download the model:
+Install `sglang-omni` with [Installation](../get_started/installation.md) on CUDA or
+[Intel XPU installation](../get_started/installation_xpu.md) on Intel GPUs, then download the model:
 
 ```bash
 hf download OpenMOSS-Team/MOSS-Transcribe-Diarize
-```
-
-Serve the model:
-
-```bash
-sgl-omni serve \
-  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
-  --port 8000 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
-  --mem-fraction-static 0.80
 ```
 
 MOSS-TD briefly holds newly built LM requests to admit larger prefills. The
@@ -119,6 +112,47 @@ work drains, it releases immediately only when decode is idle. During active
 decode, it continues coalescing until the target or deadline. Override the two
 limits with `--prefill-coalesce-requests` and `--prefill-coalesce-wait-ms`, or
 set the request target to `0` to disable coalescing.
+
+Serve the model:
+
+#### CUDA GPU
+
+```bash
+sgl-omni serve \
+  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --port 8000 \
+  --asr.engine.max_running_requests 16 \
+  --asr.engine.cuda_graph_max_bs 16 \
+  --mem-fraction-static 0.80
+```
+
+#### Intel GPU
+
+MOSS-TD with LLM and Whisper encoder XPUGraph capture has been validated in
+BF16 on one Intel Arc Pro B60 with 24 GB of memory:
+
+```bash
+sgl-omni serve \
+  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --port 8000 \
+  --asr.engine.max_running_requests 16 \
+  --asr.engine.cuda_graph_max_bs 16 \
+  --asr.engine.enable_torch_compile false \
+  --mem-fraction-static 0.70
+```
+
+The graph configuration names retain `cuda_graph` for compatibility, but
+SGLang selects the XPUGraph backend on XPU. The B60 validation uses
+`mem_fraction_static=0.70` to leave enough memory for all eight encoder graph
+buckets; `0.80` leaves too little graph-capture headroom on a 24 GB card.
+
+Before it reports ready, the server transcribes one second of audio, at most 8
+tokens. `/health` returns 503 with status `starting` until that request has
+finished, so the one-time kernel builds of the transcription path happen before
+the first user request. The first concurrent batch can still build batch-size
+kernel variants. A failed warmup stops the server. `SGLANG_OMNI_WARMUP_TIMEOUT`
+(seconds, default 600) bounds the request, and `--skip-server-warmup` reports
+ready without it.
 
 ### Sending Requests
 
@@ -154,7 +188,7 @@ for segment in payload.get("segments", []):
     )
 ```
 
-When a request omits `max_new_tokens`, the server sizes the output budget from the audio duration. The default is `max(5120, 10 tokens per audio second)`, so a 60 minute recording gets a 36000 token budget without any client changes. Operators can pin a fixed `max_new_tokens` in the stage config, which disables duration scaling for requests that omit the field. An explicit `max_new_tokens` in the request always wins over both defaults. The scheduler clamps the final value to the context remaining after the audio prompt, so large explicit values are safe to send. Set the field explicitly when you want a hard cap or a larger budget than the default, as in this example with a clip from the repo that has two speakers:
+When a request omits `max_new_tokens`, the server sizes the output budget from the audio duration in both directions: `max(512, 10 tokens per audio second)` with the stock config, so a 60 minute recording gets a 36000 token budget without any client changes, while a 6 second clip is bounded at 512 tokens instead of inheriting the old fixed 5120 default — this keeps greedy decoding from looping for thousands of tokens on short non-speech audio (#975) without truncating dense, timestamped multi-speaker transcripts. A zero-duration input uses a tighter 128-token fallback because it has no legitimate transcript to preserve. Neither bound exceeds an operator-pinned smaller default. The form also accepts `repetition_penalty` (0 < x <= 2, default 1.0 = off) to damp repetition loops on noisy audio without touching the greedy default. Operators can pin a fixed `max_new_tokens` in the stage config, which disables duration scaling for requests that omit the field. An explicit `max_new_tokens` in the request always wins over both defaults. The scheduler clamps the final value to the context remaining after the audio prompt, so large explicit values are safe to send. Set the field explicitly when you want a hard cap or a larger budget than the default, as in this example with a clip from the repo that has two speakers:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
@@ -173,7 +207,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `language` | string | unset | Optional language hint |
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
 | `temperature` | float | model default (`0.0`) | Sampling temperature |
-| `max_new_tokens` | int | duration scaled | Max generated tokens. Omitted requests default to `max(5120, 10 * audio seconds)`, or to the fixed stage value when the operator configured one. Explicit values always win and are clamped to the remaining model context |
+| `max_new_tokens` | int | duration scaled | Max generated tokens. With the stock config, omitted requests use `max(512, 10 * audio seconds)`; empty audio uses a 128-token fallback. A fixed stage value disables duration scaling. Explicit values always win and are clamped to the remaining model context |
 | `prompt` | string | unset | Optional instruction override; omit to use the built-in transcribe+diarize prompt |
 
 `verbose_json` parses the model markup into OpenAI-style `segments` with
@@ -190,8 +224,8 @@ Thanks to the Moss team for providing the benchmark datasets, we prepare movies8
 python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --dataset movies800times \
   --concurrency 16 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
+  --asr.engine.max_running_requests 16 \
+  --asr.engine.cuda_graph_max_bs 16 \
   --mem-fraction-static 0.80 \
   --output-dir results/moss_transcribe_diarize_movies800times
 
@@ -208,8 +242,8 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
 python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --dataset aishell4_long \
   --concurrency 16 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
+  --asr.engine.max_running_requests 16 \
+  --asr.engine.cuda_graph_max_bs 16 \
   --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
@@ -219,8 +253,8 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
 python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --dataset googletime \
   --concurrency 16 \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
+  --asr.engine.max_running_requests 16 \
+  --asr.engine.cuda_graph_max_bs 16 \
   --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
